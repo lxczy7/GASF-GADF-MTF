@@ -6,6 +6,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedShuffleSplit
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
@@ -64,6 +65,7 @@ def extract_sequences(X_df, y):
     logger.info(f"Extracted {len(sequences)} sequences with corresponding labels.")
     return sequences, labels
 
+
 def linear_interpolate(sequence, target_length):
     """
     对给定的时间序列进行线性插值，使其达到目标长度。
@@ -83,7 +85,7 @@ def generate_gaf_images(X, window_size, gaussian_blur=False):
     """
     生成 GASF 和 GADF 图像。
     """
-    images_GASF, images_GADF = [], []
+    images_GASF = []
 
     for feature_idx in range(X.shape[1]):
         feature_values = X[:, feature_idx]
@@ -98,40 +100,32 @@ def generate_gaf_images(X, window_size, gaussian_blur=False):
         cos_paa = np.cos(np.pi * np.array(paa_feature))
         sin_paa = np.sin(np.pi * np.array(paa_feature))
 
-        # Generate GASF and GADF matrices
+        # Generate GASF matrix
         matrix_GASF = np.outer(cos_paa, cos_paa) - np.outer(sin_paa, sin_paa)
-        matrix_GADF = np.outer(sin_paa, cos_paa) - np.outer(cos_paa, sin_paa)
 
         # Apply Gaussian Blur if required
         if gaussian_blur:
             matrix_GASF = cv2.GaussianBlur(matrix_GASF, (5, 5), 0)
-            matrix_GADF = cv2.GaussianBlur(matrix_GADF, (5, 5), 0)
 
         images_GASF.append(matrix_GASF)
-        images_GADF.append(matrix_GADF)
 
-    return np.array(images_GASF), np.array(images_GADF)
+    return np.array(images_GASF)
 
 
-def plot_images(images_GASF, images_GADF, feature_names, window_size, save_dir=None):
+def plot_images(images_GASF, feature_names, window_size, save_dir=None):
     """
-    绘制 GASF 和 GADF 图像。
+    绘制 GASF 图像。
     """
     num_features = len(images_GASF)
-    fig, axes = plt.subplots(num_features, 2, figsize=(16, 4 * num_features))
-    fig.suptitle(f"GASF and GADF Images for Each Feature (Window Size: {window_size})")
+    fig, axes = plt.subplots(num_features, 1, figsize=(8, 4 * num_features))
+    fig.suptitle(f"GASF Images for Each Feature (Window Size: {window_size})")
 
     for i in range(num_features):
-        ax1, ax2 = axes[i] if num_features > 1 else (axes[0], axes[1])
-        ax1.set_title(f'Feature {feature_names[i]} - GASF')
-        cax1 = make_axes_locatable(ax1).append_axes("right", size="5%", pad=0.2)
-        im1 = ax1.imshow(images_GASF[i], cmap=cm.jet)
-        fig.colorbar(im1, cax=cax1)
-
-        ax2.set_title(f'Feature {feature_names[i]} - GADF')
-        cax2 = make_axes_locatable(ax2).append_axes("right", size="5%", pad=0.2)
-        im2 = ax2.imshow(images_GADF[i], cmap=cm.jet)
-        fig.colorbar(im2, cax=cax2)
+        ax = axes[i] if num_features > 1 else axes
+        ax.set_title(f'Feature {feature_names[i]} - GASF')
+        cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.2)
+        im = ax.imshow(images_GASF[i], cmap=cm.jet)
+        fig.colorbar(im, cax=cax)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     if save_dir:
@@ -156,21 +150,65 @@ class WeatherDataset(Dataset):
         return sample, label
 
 
-class SimpleCNN(nn.Module):
-    def __init__(self, input_channels, num_classes, window_size):
-        super(SimpleCNN, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 16, kernel_size=(int(window_size / 2), 1), stride=1, padding=0)
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool2d(kernel_size=(2, 1))
-        self.fc1 = nn.Linear(16 * int((window_size / 2) / 2) * 7,
-                             num_classes)  # Adjusted based on output dimensions after conv and pool layers
+# Residual模块
+class Residual(nn.Module):
+    def __init__(self, input_channels, num_channels, use_1x1conv=False, stride=1):
+        super(Residual, self).__init__()
+        self.conv1 = nn.Conv2d(input_channels, num_channels, kernel_size=3, padding=1, stride=stride)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        if use_1x1conv:
+            self.conv3 = nn.Conv2d(input_channels, num_channels, kernel_size=1, stride=stride)
+        else:
+            self.conv3 = None
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        self.bn2 = nn.BatchNorm2d(num_channels)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc1(x)
+        y = F.relu(self.bn1(self.conv1(x)))
+        y = self.bn2(self.conv2(y))
+        if self.conv3:
+            x = self.conv3(x)
+        y += x
+        return F.relu(y)
+
+
+# ResNet模型
+def resnet_block(input_channels, num_channels, num_residuals, first_block=False):  # first_block用于判断是否是第一个block
+    blk = []
+    for i in range(num_residuals):
+        if i == 0 and not first_block:
+            blk.append(Residual(input_channels, num_channels, use_1x1conv=True, stride=2))
+        else:
+            blk.append(Residual(num_channels, num_channels))
+    return blk
+
+
+class ResNet(nn.Module):
+    def __init__(self, input_channels, num_classes):
+        super(ResNet, self).__init__()
+        self.b1 = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+        self.b2 = nn.Sequential(*resnet_block(64, 64, 2, first_block=True))
+        self.b3 = nn.Sequential(*resnet_block(64, 128, 2))
+        self.b4 = nn.Sequential(*resnet_block(128, 256, 2))
+        self.b5 = nn.Sequential(*resnet_block(256, 512, 2))
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.b4(x)
+        x = self.b5(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.fc(x)
         return x
 
 
@@ -239,35 +277,45 @@ def main():
     # 使用线性插值对齐所有子序列到最大长度
     aligned_sequences = [linear_interpolate(seq, max_seq_len) for seq in sequences]
     aligned_sequences = np.stack(aligned_sequences)
+    logger.info(f"Aligned sequences shape: {aligned_sequences.shape}")
 
     # 标准化数据
     scaler = StandardScaler()
     normalized_X_all = scaler.fit_transform(aligned_sequences.reshape(-1, aligned_sequences.shape[-1])).reshape(
         aligned_sequences.shape)
+    logger.info(f"Normalized X all shape: {normalized_X_all.shape}")
 
     # 定义要尝试的PAA窗口大小
-    window_sizes = [7, 16, 24]
+    window_sizes = [16, 32, 64]
     best_accuracy = 0.0
     best_window_size = None
 
     for window_size in window_sizes:
         logger.info(f"Trying window size: {window_size}")
 
-        # 生成GASF和GADF图像
-        images_GASF, images_GADF = generate_gaf_images(normalized_X_all, window_size, gaussian_blur)
+        # 生成GASF图像
+        images_GASF = generate_gaf_images(normalized_X_all, window_size, gaussian_blur)
+        logger.info(f"Images GASF shape: {images_GASF.shape}")
 
         # 绘制图像
         feature_names = X_df.columns.tolist()
-        plot_images(images_GASF, images_GADF, feature_names, window_size, save_dir)
+        plot_images(images_GASF, feature_names, window_size, save_dir)
 
         # 将图像转换为适合卷积神经网络的格式
-        X_cnn = np.stack((images_GASF, images_GADF), axis=1)  # Shape: (num_samples, 2, height, width)
+        # 形状应为 (num_samples, num_features, height, width)，其中 height 和 width 是 window_size
+        X_cnn = images_GASF.transpose(0, 1, 2, 3)  # Shape: (num_samples, num_features, height, width)
         X_cnn = torch.tensor(X_cnn, dtype=torch.float32)
         y_cnn = torch.tensor(labels, dtype=torch.long)
+        logger.info(f"X cnn shape: {X_cnn.shape}, y cnn shape: {y_cnn.shape}")
 
         # 划分训练集和测试集
         splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=1234)
-        train_indices, test_indices = next(splitter.split(X_cnn, y_cnn))
+        try:
+            train_indices, test_indices = next(splitter.split(X_cnn, y_cnn))
+        except ValueError as e:
+            logger.error(f"Error during splitting: {e}")
+            continue
+
         train_dataset = WeatherDataset(X_cnn[train_indices], y_cnn[train_indices])
         test_dataset = WeatherDataset(X_cnn[test_indices], y_cnn[test_indices])
 
@@ -275,7 +323,9 @@ def main():
         test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
         # 初始化模型、损失函数和优化器
-        model = SimpleCNN(input_channels=2, num_classes=len(np.unique(y)), window_size=window_size)
+        num_classes = len(np.unique(y))
+        num_features = X_cnn.shape[1]
+        model = ResNet(input_channels=num_features, num_classes=num_classes)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -292,3 +342,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
