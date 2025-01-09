@@ -39,7 +39,7 @@ def load_csv_data(file_path):
 
 def extract_sequences(X_df, y):
     """
-    提取具有相同天气类别的子序列。
+    提取具有相同天气类别的子序列，并为每个子序列分配唯一的标签。
     """
     sequences = []
     labels = []
@@ -50,7 +50,7 @@ def extract_sequences(X_df, y):
         if y[i] != current_label:
             if current_label is not None:
                 sequences.append(current_sequence)
-                labels.append(current_label)
+                labels.append(current_label)  # 使用第一个标签作为子序列的标签
             current_label = y[i]
             current_sequence = [X_df.iloc[i].values]
         else:
@@ -59,10 +59,10 @@ def extract_sequences(X_df, y):
     # 添加最后一个序列
     if current_label is not None:
         sequences.append(current_sequence)
-        labels.append(current_label)
+        labels.append(current_label)  # 使用第一个标签作为子序列的标签
 
+    logger.info(f"Extracted {len(sequences)} sequences with corresponding labels.")
     return sequences, labels
-
 
 def linear_interpolate(sequence, target_length):
     """
@@ -220,7 +220,7 @@ def main():
     # 配置参数
     file_path = r'E:\LX\GIT\git\test\GASF-GADF-MTF\data\weather_classification_data.csv'  # 替换为你的CSV文件路径
     gaussian_blur = False  # 是否应用高斯模糊
-    save_dir = 'output_images'  # 输出图像的目录
+    save_dir = r'E:\LX\GIT\git\test\GASF-GADF-MTF\img'  # 输出图像的目录
 
     # 创建输出目录
     if not os.path.exists(save_dir):
@@ -246,7 +246,7 @@ def main():
         aligned_sequences.shape)
 
     # 定义要尝试的PAA窗口大小
-    window_sizes = [16, 32, 64]
+    window_sizes = [7, 16, 24]
     best_accuracy = 0.0
     best_window_size = None
 
