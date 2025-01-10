@@ -2,11 +2,10 @@ import os
 import numpy as np
 import pandas as pd
 import logging
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
 from sklearn.model_selection import StratifiedShuffleSplit
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
@@ -14,6 +13,7 @@ from matplotlib import cm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import cv2
 from scipy.interpolate import interp1d
+from torch.nn import functional as F
 
 # 设置日志记录器
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +36,24 @@ def load_csv_data(file_path):
     y = df.iloc[:, -1]  # 最后一列作为标签
 
     return X_df, y
+
+
+def remove_constant_features(X_df):
+    """
+    删除所有常数特征。
+    """
+    constant_features = []
+    for col in X_df.columns:
+        if X_df[col].nunique() <= 1:
+            constant_features.append(col)
+
+    if constant_features:
+        logger.info(f"Removing constant features: {constant_features}")
+        X_df.drop(columns=constant_features, inplace=True)
+    else:
+        logger.info("No constant features found.")
+
+    return X_df
 
 
 def extract_sequences(X_df, y):
@@ -81,56 +99,131 @@ def linear_interpolate(sequence, target_length):
     return interpolated_sequence
 
 
+def global_min_max_scale(data):
+    """
+    对整个数据集进行最小最大归一化，使其范围在 [-1, 1] 之间。
+    """
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaled_data = scaler.fit_transform(data)
+    return scaled_data, scaler
+
+
 def generate_gaf_images(X, window_size, gaussian_blur=False):
     """
-    生成 GASF 和 GADF 图像。
+    生成 GASF 图像。
     """
     images_GASF = []
+    valid_labels = []  # 存储有效的标签
 
-    for feature_idx in range(X.shape[1]):
-        feature_values = X[:, feature_idx]
-        scaled_feature = (feature_values - np.min(feature_values)) / (np.max(feature_values) - np.min(feature_values))
+    for sample_idx in range(X.shape[0]):
+        gafs = []
+        for feature_idx in range(X.shape[2]):
+            feature_values = X[sample_idx, :, feature_idx]
 
-        # Piecewise Aggregation Approximation (PAA)
-        paa_feature = [scaled_feature[
-                       t * (len(scaled_feature) // window_size):(t + 1) * (len(scaled_feature) // window_size)].mean()
-                       for t in range(window_size)]
+            # Piecewise Aggregation Approximation (PAA)
+            paa_feature = [feature_values[t * (len(feature_values) // window_size):(t + 1) * (
+                        len(feature_values) // window_size)].mean()
+                           for t in range(window_size)]
 
-        # Convert to cosine and sine
-        cos_paa = np.cos(np.pi * np.array(paa_feature))
-        sin_paa = np.sin(np.pi * np.array(paa_feature))
+            # Convert to cosine and sine
+            cos_paa = np.cos(np.pi * np.clip(paa_feature, -1, 1))  # Clip values to avoid numerical instability
+            sin_paa = np.sin(np.pi * np.clip(paa_feature, -1, 1))  # Clip values to avoid numerical instability
 
-        # Generate GASF matrix
-        matrix_GASF = np.outer(cos_paa, cos_paa) - np.outer(sin_paa, sin_paa)
+            # Generate GASF matrix
+            matrix_GASF = np.outer(cos_paa, cos_paa) - np.outer(sin_paa, sin_paa)
 
-        # Apply Gaussian Blur if required
-        if gaussian_blur:
-            matrix_GASF = cv2.GaussianBlur(matrix_GASF, (5, 5), 0)
+            # Apply Gaussian Blur if required
+            if gaussian_blur:
+                matrix_GASF = cv2.GaussianBlur(matrix_GASF, (5, 5), 0)
 
-        images_GASF.append(matrix_GASF)
+            gafs.append(matrix_GASF)
 
-    return np.array(images_GASF)
+        if gafs:  # 只有当至少有一个有效的GASF矩阵时才添加
+            images_GASF.append(gafs)
+            valid_labels.append(sample_idx)
+
+    if not images_GASF:
+        raise ValueError("No valid GASF images generated. All features may have constant values across samples.")
+
+    logger.info(f"Generated {len(images_GASF)} valid GASF images.")
+    return np.array(images_GASF), valid_labels
 
 
-def plot_images(images_GASF, feature_names, window_size, save_dir=None):
+def generate_gadf_images(X, window_size, gaussian_blur=False):
     """
-    绘制 GASF 图像。
+    生成 GADF 图像。
     """
-    num_features = len(images_GASF)
-    fig, axes = plt.subplots(num_features, 1, figsize=(8, 4 * num_features))
-    fig.suptitle(f"GASF Images for Each Feature (Window Size: {window_size})")
+    images_GADF = []
+    valid_labels = []  # 存储有效的标签
 
-    for i in range(num_features):
-        ax = axes[i] if num_features > 1 else axes
-        ax.set_title(f'Feature {feature_names[i]} - GASF')
-        cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.2)
-        im = ax.imshow(images_GASF[i], cmap=cm.jet)
-        fig.colorbar(im, cax=cax)
+    for sample_idx in range(X.shape[0]):
+        gadfs = []
+        for feature_idx in range(X.shape[2]):
+            feature_values = X[sample_idx, :, feature_idx]
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    if save_dir:
-        plt.savefig(os.path.join(save_dir, f"gaf_images_window_{window_size}.png"))
-    plt.show()
+            # Piecewise Aggregation Approximation (PAA)
+            paa_feature = [feature_values[t * (len(feature_values) // window_size):(t + 1) * (
+                        len(feature_values) // window_size)].mean()
+                           for t in range(window_size)]
+
+            # Convert to cosine and sine
+            cos_paa = np.cos(np.pi * np.clip(paa_feature, -1, 1))  # Clip values to avoid numerical instability
+            sin_paa = np.sin(np.pi * np.clip(paa_feature, -1, 1))  # Clip values to avoid numerical instability
+
+            # Generate GADF matrix
+            matrix_GADF = np.outer(cos_paa, sin_paa) - np.outer(sin_paa, cos_paa)
+
+            # Apply Gaussian Blur if required
+            if gaussian_blur:
+                matrix_GADF = cv2.GaussianBlur(matrix_GADF, (5, 5), 0)
+
+            gadfs.append(matrix_GADF)
+
+        if gadfs:  # 只有当至少有一个有效的GADF矩阵时才添加
+            images_GADF.append(gadfs)
+            valid_labels.append(sample_idx)
+
+    if not images_GADF:
+        raise ValueError("No valid GADF images generated. All features may have constant values across samples.")
+
+    logger.info(f"Generated {len(images_GADF)} valid GADF images.")
+    return np.array(images_GADF), valid_labels
+
+
+def generate_position_encoding(window_size):
+    """
+    生成非对称的位置编码图像。
+    """
+    position_encoding = np.zeros((window_size, window_size))
+    for i in range(window_size):
+        for j in range(window_size):
+            position_encoding[i, j] = i / (window_size - 1) + j / (window_size - 1) ** 2
+    return position_encoding
+
+
+def plot_images(images, image_type, feature_names, window_size, save_dir=None):
+    """
+    绘制图像。
+    """
+    num_samples = images.shape[0]
+
+    for sample_idx in range(min(num_samples, 5)):  # 仅绘制前5个样本以节省空间
+        num_features = images[sample_idx].shape[0]
+        fig, axes = plt.subplots(num_features, 1, figsize=(8, 4 * num_features))
+        fig.suptitle(f"{image_type} Images for Sample {sample_idx} (Window Size: {window_size})")
+
+        for i in range(num_features):
+            ax = axes[i] if num_features > 1 else axes
+            ax.set_title(f'Feature {feature_names[i]} - {image_type}')
+            cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.2)
+            im = ax.imshow(images[sample_idx, i], cmap=cm.jet)
+            fig.colorbar(im, cax=cax)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_dir:
+            plt.savefig(
+                os.path.join(save_dir, f"{image_type.lower()}_images_sample_{sample_idx}_window_{window_size}.png"))
+        plt.show()
 
 
 class WeatherDataset(Dataset):
@@ -172,7 +265,32 @@ class Residual(nn.Module):
         return F.relu(y)
 
 
-# ResNet模型
+# 简化的ResNet模型
+class SimpleResNet(nn.Module):
+    def __init__(self, input_channels, num_classes):
+        super(SimpleResNet, self).__init__()
+        self.b1 = nn.Sequential(
+            nn.Conv2d(input_channels, 16, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        )
+        self.b2 = nn.Sequential(*resnet_block(16, 16, 1, first_block=True))  # 修改此处：保持输入输出通道一致
+        self.b3 = nn.Sequential(*resnet_block(16, 16, 1))  # 修改此处：保持输入输出通道一致
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(16, num_classes)  # 修改此处：与最后的通道数一致
+
+    def forward(self, x):
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        return x
+
+
 def resnet_block(input_channels, num_channels, num_residuals, first_block=False):  # first_block用于判断是否是第一个block
     blk = []
     for i in range(num_residuals):
@@ -183,36 +301,7 @@ def resnet_block(input_channels, num_channels, num_residuals, first_block=False)
     return blk
 
 
-class ResNet(nn.Module):
-    def __init__(self, input_channels, num_classes):
-        super(ResNet, self).__init__()
-        self.b1 = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        )
-        self.b2 = nn.Sequential(*resnet_block(64, 64, 2, first_block=True))
-        self.b3 = nn.Sequential(*resnet_block(64, 128, 2))
-        self.b4 = nn.Sequential(*resnet_block(128, 256, 2))
-        self.b5 = nn.Sequential(*resnet_block(256, 512, 2))
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(512, num_classes)
-
-    def forward(self, x):
-        x = self.b1(x)
-        x = self.b2(x)
-        x = self.b3(x)
-        x = self.b4(x)
-        x = self.b5(x)
-        x = self.avgpool(x)
-        x = self.flatten(x)
-        x = self.fc(x)
-        return x
-
-
-def train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, num_epochs, device):
+def train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs, device):
     model.to(device)
     best_accuracy = 0.0
 
@@ -251,12 +340,15 @@ def train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, n
             best_accuracy = accuracy
             torch.save(model.state_dict(), 'best_model.pth')
 
+        # Step the scheduler
+        scheduler.step(running_loss / len(train_loader))
+
     return best_accuracy
 
 
 def main():
     # 配置参数
-    file_path = r'E:\LX\GIT\git\test\GASF-GADF-MTF\data\weather_classification_data.csv'  # 替换为你的CSV文件路径
+    file_path = 'E:\\LX\\GIT\\git\\test\\GASF-GADF-MTF\\data\\weather_classification_data.csv'  # 替换为你的CSV文件路径
     gaussian_blur = False  # 是否应用高斯模糊
     save_dir = r'E:\LX\GIT\git\test\GASF-GADF-MTF\img'  # 输出图像的目录
 
@@ -266,6 +358,9 @@ def main():
 
     # 加载数据
     X_df, y = load_csv_data(file_path)
+
+    # 删除常数特征
+    X_df = remove_constant_features(X_df)
 
     # 提取具有相同天气类别的子序列
     sequences, labels = extract_sequences(X_df, y)
@@ -280,33 +375,62 @@ def main():
     logger.info(f"Aligned sequences shape: {aligned_sequences.shape}")
 
     # 标准化数据
-    scaler = StandardScaler()
-    normalized_X_all = scaler.fit_transform(aligned_sequences.reshape(-1, aligned_sequences.shape[-1])).reshape(
-        aligned_sequences.shape)
+    flattened_sequences = aligned_sequences.reshape(-1, aligned_sequences.shape[-1])
+    normalized_X_all_flattened, scaler = global_min_max_scale(flattened_sequences)
+    normalized_X_all = normalized_X_all_flattened.reshape(aligned_sequences.shape)
     logger.info(f"Normalized X all shape: {normalized_X_all.shape}")
 
-    # 定义要尝试的PAA窗口大小
-    window_sizes = [16, 32, 64]
-    best_accuracy = 0.0
-    best_window_size = None
+    # 定义窗口大小为最长序列长度
+    window_size = max_seq_len
+    logger.info(f"Using window size: {window_size}")
 
-    for window_size in window_sizes:
-        logger.info(f"Trying window size: {window_size}")
-
+    try:
         # 生成GASF图像
-        images_GASF = generate_gaf_images(normalized_X_all, window_size, gaussian_blur)
+        images_GASF, valid_labels = generate_gaf_images(normalized_X_all, window_size, gaussian_blur)
         logger.info(f"Images GASF shape: {images_GASF.shape}")
+
+        # 生成GADF图像
+        images_GADF, _ = generate_gadf_images(normalized_X_all, window_size, gaussian_blur)
+        logger.info(f"Images GADF shape: {images_GADF.shape}")
+
+        # 生成位置编码图像
+        position_encoding = generate_position_encoding(window_size)
+        position_encoding_expanded = np.expand_dims(position_encoding, axis=0)  # Shape: (1, window_size, window_size)
+        position_encoding_expanded = np.repeat(position_encoding_expanded, images_GASF.shape[1],
+                                               axis=0)  # Repeat for each feature
+        position_encoding_expanded = np.expand_dims(position_encoding_expanded,
+                                                    axis=0)  # Shape: (1, num_features, window_size, window_size)
+        position_encoding_expanded = np.repeat(position_encoding_expanded, images_GASF.shape[0],
+                                               axis=0)  # Repeat for each sample
+        logger.info(f"Position encoding expanded shape: {position_encoding_expanded.shape}")
+
+        # 计算GASF和GADF的差值并进行指数化处理
+        diff_images = images_GASF - images_GADF
+        exp_diff_images = np.exp(diff_images)
+        logger.info(f"Exponentiated difference images shape: {exp_diff_images.shape}")
+
+        # 添加位置编码
+        final_images = exp_diff_images + position_encoding_expanded
+        logger.info(f"Final images shape after adding position encoding: {final_images.shape}")
 
         # 绘制图像
         feature_names = X_df.columns.tolist()
-        plot_images(images_GASF, feature_names, window_size, save_dir)
+        plot_images(final_images, "Final Exponentiated Difference with Position Encoding", feature_names, window_size,
+                    save_dir)
 
         # 将图像转换为适合卷积神经网络的格式
         # 形状应为 (num_samples, num_features, height, width)，其中 height 和 width 是 window_size
-        X_cnn = images_GASF.transpose(0, 1, 2, 3)  # Shape: (num_samples, num_features, height, width)
+        X_cnn = final_images.transpose(0, 1, 2, 3)  # Shape: (num_samples, num_features, height, width)
         X_cnn = torch.tensor(X_cnn, dtype=torch.float32)
-        y_cnn = torch.tensor(labels, dtype=torch.long)
+
+        # 更新标签以匹配有效样本
+        y_cnn = torch.tensor([labels[lbl] for lbl in valid_labels], dtype=torch.long)
         logger.info(f"X cnn shape: {X_cnn.shape}, y cnn shape: {y_cnn.shape}")
+
+        # 检查是否有足够的样本进行训练
+        if len(X_cnn) < 2:
+            logger.error("Not enough valid samples to perform training and evaluation.")
+            return
 
         # 划分训练集和测试集
         splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=1234)
@@ -314,33 +438,31 @@ def main():
             train_indices, test_indices = next(splitter.split(X_cnn, y_cnn))
         except ValueError as e:
             logger.error(f"Error during splitting: {e}")
-            continue
+            return
 
         train_dataset = WeatherDataset(X_cnn[train_indices], y_cnn[train_indices])
         test_dataset = WeatherDataset(X_cnn[test_indices], y_cnn[test_indices])
 
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
         # 初始化模型、损失函数和优化器
-        num_classes = len(np.unique(y))
+        num_classes = len(np.unique(y_cnn.numpy()))
         num_features = X_cnn.shape[1]
-        model = ResNet(input_channels=num_features, num_classes=num_classes)
+        model = SimpleResNet(input_channels=num_features, num_classes=num_classes)
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        optimizer = optim.Adam(model.parameters(), lr=0.1)  # 减少学习率
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
         # 训练和评估模型
-        accuracy = train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, num_epochs=10,
+        accuracy = train_and_evaluate(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=100,
                                       device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_window_size = window_size
+        logger.info(f"Best accuracy: {accuracy:.2f}%")
 
-    logger.info(f"Best window size: {best_window_size}, Best accuracy: {best_accuracy:.2f}%")
+    except ValueError as ve:
+        logger.error(f"ValueError encountered: {ve}")
 
 
 if __name__ == "__main__":
     main()
-
-
